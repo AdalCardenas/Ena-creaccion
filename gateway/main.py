@@ -20,9 +20,9 @@ sta.disconnect()
 ap = network.WLAN(network.AP_IF)
 ap.active(True)
 try:
-    ap.config(channel=1, hidden=True, essid="")
-except:
-    pass
+    ap.config(channel=1)
+except Exception as err:
+    print("Aviso canal AP:", err)
 
 e = espnow.ESPNow()
 e.active(True)
