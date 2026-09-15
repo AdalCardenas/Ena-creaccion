@@ -1,2 +1,2 @@
-# Ena-receptor
-Nodo de Campo / Micro-PLC Autónomo, Es el operador físico situado donde están los aparatos (luces, bombas, sensores), Alberga el motor de reglas en MicroPython. Recibe las instrucciones por radio, las almacena en memoria y gobierna de forma autónoma sus pines (leyendo sensores analógicos/digitales y accionando relevadores o temporizadores).
+# Ena-creaccion
+Un puente entre el lenguaje humano y el mundo físico: conecta sensores y actuadores a un ESP32, dile a Hermes Agent qué quieres que haga y deja que la IA configure una red de micro-PLCs autónomos por radio sin que tengas que escribir una sola línea de código ni tocar una dirección MAC.
