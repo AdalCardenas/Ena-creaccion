@@ -11,20 +11,18 @@ import select
 import time
 import gc
 
-# 1. Configurar radio en modo Estación (STA)
+# 1. Configurar radio en modo Estación (STA) y fijar canal 1
 sta = network.WLAN(network.STA_IF)
 sta.active(True)
 sta.disconnect()
 
-# En firmware reciente se puede configurar el canal en STA;
-# como fallback se usa la interfaz AP:
+# Dejar AP activo en canal 1 bloquea el sintetizador de radio del ESP32 en canal 1
+ap = network.WLAN(network.AP_IF)
+ap.active(True)
 try:
-    sta.config(channel=1)
-except ValueError:
-    ap = network.WLAN(network.AP_IF)
-    ap.active(True)
-    ap.config(channel=1)
-    ap.active(False)
+    ap.config(channel=1, hidden=True, essid="")
+except:
+    pass
 
 e = espnow.ESPNow()
 e.active(True)

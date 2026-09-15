@@ -15,26 +15,27 @@ ARCHIVO_REGLAS = "reglas.json"
 BROADCAST_MAC = b'\xff\xff\xff\xff\xff\xff'
 PIN_LED_IDENT = 2  # LED azul integrado en la mayoría de ESP32 DevKit
 
-# 1. Configurar radio Wi-Fi en Canal 1 (igual que el Gateway)
+# 1. Configurar radio en modo Estación (STA) y fijar canal 1
 sta = network.WLAN(network.STA_IF)
 sta.active(True)
 sta.disconnect()
 
+# Dejar AP activo en canal 1 bloquea el sintetizador de radio del ESP32 en canal 1
+ap = network.WLAN(network.AP_IF)
+ap.active(True)
 try:
-    sta.config(channel=1)
-except ValueError:
-    ap = network.WLAN(network.AP_IF)
-    ap.active(True)
-    ap.config(channel=1)
-    ap.active(False)
+    ap.config(channel=1, hidden=True, essid="")
+except:
+    pass
 
 # 2. Inicializar ESP-NOW y registrar broadcast para balizas
 e = espnow.ESPNow()
 e.active(True)
 try:
     e.add_peer(BROADCAST_MAC)
-except OSError:
-    pass
+    print("ESP-NOW activo. Peer broadcast registrado en canal 1.")
+except Exception as err:
+    print("Aviso al registrar broadcast:", err)
 
 # LED de identificación física
 led_ident = machine.Pin(PIN_LED_IDENT, machine.Pin.OUT)
@@ -87,9 +88,10 @@ while True:
             "reglas": len(motor.reglas)
         }).encode('utf-8')
         try:
-            e.send(BROADCAST_MAC, beacon_data)
-        except OSError:
-            pass
+            exito = e.send(BROADCAST_MAC, beacon_data)
+            print(f"[Nodo] Baliza emitida ({len(beacon_data)} bytes, enviado={exito})")
+        except Exception as err:
+            print("[Nodo] Error al emitir baliza:", err)
 
     # --- B. Parpadeo de Identificación Visual si fue solicitado ---
     if tiempo_fin_ident > 0:

@@ -84,6 +84,17 @@ class SerialManager:
     def _procesar_linea_gateway(self, linea: str):
         try:
             evento = json.loads(linea)
+
+            # Mensaje de arranque o estado del Gateway
+            if "sistema" in evento:
+                print(f"[Gateway Evento] {linea}")
+                return
+
+            # Mensajes de error del Gateway
+            if "error" in evento:
+                print(f"[Gateway Alerta] {linea}")
+                return
+
             # Evento desde un nodo: {"from": "MAC", "data": {...}}
             if "from" in evento and "data" in evento:
                 mac = evento["from"]
@@ -101,9 +112,12 @@ class SerialManager:
                         "timestamp": time.time()
                     }
                     print(f"[Telemetría] Respuesta de {mac}: {datos}")
+                else:
+                    print(f"[Nodo {mac}] Datos: {datos}")
 
         except json.JSONDecodeError:
-            pass
+            # Si no es JSON, puede ser un traceback o mensaje de print de MicroPython
+            print(f"[Gateway Salida] {linea}")
 
     def enviar(self, mac: str, payload: dict) -> bool:
         """Transmite una trama hacia un nodo a través del Gateway."""
