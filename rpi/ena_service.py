@@ -56,6 +56,22 @@ class SerialManager:
             self.port = self._detectar_puerto()
             print(f"[Serial] Intentando conectar al Gateway en {self.port} a {BAUD_RATE}...")
             self.serial_conn = serial.Serial(self.port, BAUD_RATE, timeout=1)
+
+            # Auto-reinicio por hardware del ESP32 vía DTR/RTS
+            # Evita que el chip quede atrapado en el modo ROM bootloader tras reiniciar la Pi
+            try:
+                self.serial_conn.dtr = False
+                self.serial_conn.rts = True
+                time.sleep(0.1)
+                self.serial_conn.rts = False
+                time.sleep(0.4)
+                self.serial_conn.reset_input_buffer()
+                self.serial_conn.reset_output_buffer()
+                self.serial_conn.write(b"\n")
+                self.serial_conn.flush()
+            except Exception as reset_err:
+                print(f"[Serial] Aviso en auto-reinicio DTR/RTS: {reset_err}")
+
             print(f"[Serial] Conectado exitosamente en {self.port}")
         except Exception as e:
             print(f"[Serial] Advertencia: No se pudo abrir puerto serie ({e}). Iniciando en modo simulado.")
@@ -78,8 +94,15 @@ class SerialManager:
                 if linea:
                     self._procesar_linea_gateway(linea)
             except Exception as e:
-                print(f"[Serial] Error leyendo trama: {e}")
-                time.sleep(1)
+                print(f"[Serial] Error en conexión serie: {e}. Reintentando reconectar en 2s...")
+                try:
+                    if self.serial_conn:
+                        self.serial_conn.close()
+                except:
+                    pass
+                self.serial_conn = None
+                time.sleep(2)
+                self._conectar()
 
     def _procesar_linea_gateway(self, linea: str):
         try:

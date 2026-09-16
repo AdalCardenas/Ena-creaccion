@@ -5,6 +5,7 @@ Proyecto: Ena-creaccion
 """
 import network
 import espnow
+import machine
 import sys
 import ujson
 import select
@@ -27,6 +28,9 @@ except Exception as err:
 e = espnow.ESPNow()
 e.active(True)
 
+# Watchdog Timer por hardware (5 segundos): si el chip se bloquea, se reinicia solo
+wdt = machine.WDT(timeout=5000)
+
 # Registro de peers en memoria para no exceder los 20 máximos de hardware ESP-NOW
 peers_registrados = []
 MAX_PEERS = 18  # Margen de seguridad sobre el límite de 20
@@ -47,19 +51,24 @@ def registrar_peer(mac_bytes):
         return True
     except Exception as err:
         sys.stdout.write(f'{{"error":"peer_error","detalle":"{str(err)}"}}\n')
+        sys.stdout.flush()
         return False
 
 def mac_texto_a_bytes(mac_str):
     """Convierte dirección MAC en formato texto 'AA:BB:CC:DD:EE:FF' a bytes."""
     return bytes(int(b, 16) for b in mac_str.split(':'))
 
-# 2. Monitoreo del puerto serie
+# 2. Monitoreo del puerto serie no bloqueante
 poll = select.poll()
 poll.register(sys.stdin, select.POLLIN)
 
 sys.stdout.write('{"sistema":"gateway_listo","canal":1}\n')
+sys.stdout.flush()
+
+buffer_serie = ""
 
 while True:
+    wdt.feed()
     hubo_actividad = False
 
     # --- A. Paquetes entrantes desde los nodos (Radio -> Serie) ---
@@ -68,34 +77,48 @@ while True:
         hubo_actividad = True
         mac_origen = ":".join(f"{b:02X}" for b in host)
         try:
-            # Intentar decodificar como texto/json seguro
             msg_str = msg.decode("utf-8")
             sys.stdout.write(f'{{"from":"{mac_origen}","data":{msg_str}}}\n')
+            sys.stdout.flush()
         except UnicodeError:
             sys.stdout.write(f'{{"from":"{mac_origen}","error":"trama_corrupta"}}\n')
+            sys.stdout.flush()
 
-    # --- B. Comandos entrantes desde el Host (Serie -> Radio) ---
+    # --- B. Comandos entrantes desde el Host (Serie -> Radio) - 100% No Bloqueante ---
     if poll.poll(0):
-        hubo_actividad = True
-        linea = sys.stdin.readline().strip()
-        if linea:
-            try:
-                paquete = ujson.loads(linea)
-                mac_destino = mac_texto_a_bytes(paquete["node"])
+        while poll.poll(0):
+            ch = sys.stdin.read(1)
+            if not ch:
+                break
+            if ch == '\n':
+                linea = buffer_serie.strip()
+                buffer_serie = ""
+                if linea:
+                    hubo_actividad = True
+                    try:
+                        paquete = ujson.loads(linea)
+                        mac_destino = mac_texto_a_bytes(paquete["node"])
 
-                if registrar_peer(mac_destino):
-                    payload_obj = paquete.get("payload", paquete.get("reglas", paquete.get("cmd")))
-                    payload_bytes = ujson.dumps(payload_obj).encode('utf-8')
-                    
-                    if len(payload_bytes) > 250:
-                        sys.stdout.write('{"error":"payload_muy_grande","max":250}\n')
-                    else:
-                        # e.send() devuelve True si el nodo respondió con ACK de radio
-                        ack = e.send(mac_destino, payload_bytes)
-                        sys.stdout.write(f'{{"sistema":"comando_transmitido","ack":{ "true" if ack else "false" }}}\n')
-            except Exception as err:
-                sys.stdout.write(f'{{"error":"gateway_error","detalle":"{str(err)}"}}\n')
+                        if registrar_peer(mac_destino):
+                            payload_obj = paquete.get("payload", paquete.get("reglas", paquete.get("cmd")))
+                            payload_bytes = ujson.dumps(payload_obj).encode('utf-8')
 
-    # Si no hubo actividad en este ciclo, ceder brevemente la CPU para no saturar núcleos ni WDT
+                            if len(payload_bytes) > 250:
+                                sys.stdout.write('{"error":"payload_muy_grande","max":250}\n')
+                                sys.stdout.flush()
+                            else:
+                                ack = e.send(mac_destino, payload_bytes)
+                                sys.stdout.write(f'{{"sistema":"comando_transmitido","ack":{ "true" if ack else "false" }}}\n')
+                                sys.stdout.flush()
+                    except Exception as err:
+                        sys.stdout.write(f'{{"error":"gateway_error","detalle":"{str(err)}"}}\n')
+                        sys.stdout.flush()
+            elif ch != '\r':
+                buffer_serie += ch
+                # Si llega basura que excede 500 caracteres sin salto de línea, vaciar buffer
+                if len(buffer_serie) > 500:
+                    buffer_serie = ""
+
+    # Si no hubo actividad en este ciclo, ceder brevemente la CPU
     if not hubo_actividad:
         time.sleep_ms(2)
