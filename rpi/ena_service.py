@@ -278,16 +278,17 @@ class APIServer(BaseHTTPRequestHandler):
             reglas = datos.get("reglas", [])
 
             disp = self.registry.buscar_dispositivo(target)
-            if not disp:
+            if not disp and ":" not in target:
                 self._responder_json(404, {"error": f"Dispositivo '{target}' no encontrado"})
                 return
 
+            mac = disp["mac"] if disp else target
             try:
                 trama, _ = RuleCompiler.empaquetar_reglas(reglas)
-                exito = self.serial_mgr.enviar(disp["mac"], trama)
-                if exito:
+                exito = self.serial_mgr.enviar(mac, trama)
+                if exito and disp:
                     self.registry.actualizar_reglas(target, reglas)
-                self._responder_json(200, {"status": "enviado" if exito else "error", "mac": disp["mac"]})
+                self._responder_json(200, {"status": "enviado" if exito else "error", "mac": mac})
             except Exception as err:
                 self._responder_json(400, {"error": str(err)})
 
@@ -336,6 +337,22 @@ class APIServer(BaseHTTPRequestHandler):
             self.serial_mgr.enviar(disp["mac"], {"r": []})
             eliminado = self.registry.eliminar_dispositivo(target)
             self._responder_json(200, {"status": "desvinculado", "dispositivo": eliminado})
+
+        # 8. Enviar texto a pantalla OLED
+        elif ruta == "/api/display":
+            target = datos.get("target")
+            lineas = datos.get("lineas", [])
+
+            disp = self.registry.buscar_dispositivo(target)
+            mac = disp["mac"] if disp else target
+
+            paquete_cmd = {"cmd": "display", "lineas": lineas}
+            exito = self.serial_mgr.enviar(mac, paquete_cmd)
+            self._responder_json(200, {
+                "status": "enviado" if exito else "error",
+                "dispositivo": disp["alias"] if disp else target,
+                "lineas": lineas
+            })
 
         else:
             self._responder_json(404, {"error": "Ruta no encontrada"})

@@ -207,6 +207,54 @@ def desvincular_dispositivo(dispositivo: str) -> str:
     return f"El dispositivo '{alias}' ha sido desvinculado y reseteado. Si sigue encendido, volverá a aparecer como nuevo."
 
 
+def crear_automatizacion_compuesta(dispositivo: str, lista_condiciones: list,
+                                   logica: str = "AND", pin_actuador: int = None,
+                                   accion: str = "encender",
+                                   tipo_temporizador: str = "inmediato",
+                                   tiempo_segundos: float = 0) -> str:
+    """
+    Programa una regla con múltiples condiciones simultáneas (AND/OR).
+    Ejemplo: 'enciende el aire si temp > 28 y ventana == cerrada y puerta == cerrada'.
+    lista_condiciones es una lista de diccionarios, ej:
+    [{"pin": 4, "sub": "temp", "op": ">", "val": 28}, {"pin": 13, "op": "==", "val": 1}]
+    """
+    from rule_compiler import RuleCompiler
+
+    act_val = 1 if accion.lower() in ["encender", "activar", "high", "1"] else 0
+    regla = RuleCompiler.compilar_regla_compuesta(
+        condiciones=lista_condiciones,
+        logica=logica,
+        p_out=pin_actuador,
+        accion=act_val,
+        tipo_timer=tipo_temporizador,
+        tiempo_segundos=tiempo_segundos
+    )
+
+    payload = {
+        "target": dispositivo,
+        "reglas": [regla]
+    }
+    res = _peticion_http("POST", "/api/send_rules", payload)
+    if "error" in res:
+        return res["error"]
+    return f"Automatización multi-condición ({logica}) programada con éxito en '{dispositivo}'."
+
+
+def mostrar_en_pantalla(dispositivo: str, lineas: list) -> str:
+    """
+    Muestra hasta 6 líneas de texto en la pantalla OLED física conectada al ESP32.
+    Ejemplo: lineas=["Temp: 24 C", "Aire: ON"]
+    """
+    payload = {
+        "target": dispositivo,
+        "lineas": lineas
+    }
+    res = _peticion_http("POST", "/api/display", payload)
+    if "error" in res:
+        return res["error"]
+    return f"Texto enviado a la pantalla de '{dispositivo}'."
+
+
 # ============================================================================
 # ESQUEMAS DE FUNCTION CALLING / TOOL CALLING PARA HERMES AGENT
 # ============================================================================
@@ -342,5 +390,49 @@ HERMES_TOOLS_SCHEMAS = [
                 "required": ["dispositivo"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "crear_automatizacion_compuesta",
+            "description": "Programa una regla con múltiples condiciones evaluadas con lógica AND o OR (ej. si temp > 28 y ventana cerrada y puerta cerrada entonces prender aire).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dispositivo": {"type": "string", "description": "Nombre del dispositivo donde se instalará la regla."},
+                    "lista_condiciones": {
+                        "type": "array",
+                        "description": "Lista de condiciones. Cada una con 'pin', 'op' (==, !=, >, <), 'val', y opcional 'sub' ('temp' o 'hum').",
+                        "items": {"type": "object"}
+                    },
+                    "logica": {"type": "string", "enum": ["AND", "OR"], "description": "'AND' (todas deben cumplirse) o 'OR' (al menos una)."},
+                    "pin_actuador": {"type": "integer", "description": "Pin de salida que se accionará."},
+                    "accion": {"type": "string", "description": "'encender' o 'apagar'."},
+                    "tipo_temporizador": {"type": "string", "description": "'inmediato', 'retardo' (TON), o 'pulso'."},
+                    "tiempo_segundos": {"type": "number", "description": "Segundos para el temporizador, si aplica."}
+                },
+                "required": ["dispositivo", "lista_condiciones", "pin_actuador"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mostrar_en_pantalla",
+            "description": "Envía hasta 6 líneas de texto para mostrar en la pantalla OLED del ESP32.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dispositivo": {"type": "string", "description": "Nombre del dispositivo con pantalla."},
+                    "lineas": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Lista de hasta 6 textos a mostrar en el display."
+                    }
+                },
+                "required": ["dispositivo", "lineas"]
+            }
+        }
     }
 ]
+

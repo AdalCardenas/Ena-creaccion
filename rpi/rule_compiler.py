@@ -83,6 +83,45 @@ class RuleCompiler:
         return [r_id, -1, OP_INCONDICIONAL, 0, p_out, accion, TIMER_PULSO, t_ms]
 
     @staticmethod
+    def compilar_regla_compuesta(condiciones: list, logica: str = "AND",
+                                  p_out: int = None, accion: int = 1,
+                                  tipo_timer="inmediato", tiempo_segundos: float = 0,
+                                  r_id: int = 1):
+        """
+        Crea una regla con múltiples condiciones evaluadas con lógica AND o OR.
+        Cada condición en 'condiciones' es:
+        - {"pin": 4, "op": ">", "val": 28, "sub": "temp"} o [pin, op, val]
+        Retorna: [r_id, [[p1, op1, v1], [p2, op2, v2], ...], logica_code, 0, p_out, act, t_type, t_ms]
+        """
+        subcondiciones = []
+        for c in condiciones:
+            if isinstance(c, dict):
+                p = c.get("pin")
+                sub_canal = c.get("sub")
+                p_spec = [p, sub_canal] if sub_canal else p
+                op = c.get("op", "==")
+                op_code = MAPA_OPERADORES.get(str(op).lower(), OP_IGUAL)
+                val = c.get("val", 1)
+                subcondiciones.append([p_spec, op_code, val])
+            elif isinstance(c, (list, tuple)):
+                p = c[0]
+                op = c[1]
+                op_code = MAPA_OPERADORES.get(str(op).lower(), op) if isinstance(op, str) else int(op)
+                val = c[2]
+                subcondiciones.append([p, op_code, val])
+
+        logica_code = 0 if str(logica).upper() == "AND" else 1
+
+        if isinstance(tipo_timer, str):
+            t_type_code = MAPA_TIMERS.get(tipo_timer.lower(), TIMER_INMEDIATO)
+        else:
+            t_type_code = int(tipo_timer)
+
+        t_ms = int(tiempo_segundos * 1000)
+
+        return [r_id, subcondiciones, logica_code, 0, p_out, accion, t_type_code, t_ms]
+
+    @staticmethod
     def empaquetar_reglas(lista_reglas):
         """
         Envuelve la lista de reglas en el formato de trama esperado por el nodo:

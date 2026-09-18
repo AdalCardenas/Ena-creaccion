@@ -51,6 +51,21 @@ class TestEnaSystem(unittest.TestCase):
         self.assertIn("r", trama)
         self.assertEqual(len(trama["r"]), 2)
 
+        # Caso D: Regla multi-condición (Temp > 28 AND Ventana == 1 AND Puerta == 1)
+        condiciones = [
+            {"pin": 4, "sub": "temp", "op": ">", "val": 28},
+            {"pin": 13, "op": "==", "val": 1},
+            {"pin": 14, "op": "==", "val": 1}
+        ]
+        regla_compuesta = RuleCompiler.compilar_regla_compuesta(
+            condiciones=condiciones, logica="AND", p_out=15, accion=1
+        )
+        self.assertEqual(regla_compuesta[0], 1)  # r_id
+        self.assertEqual(regla_compuesta[2], 0)  # logica_code 0 = AND
+        self.assertEqual(len(regla_compuesta[1]), 3) # 3 subcondiciones
+        trama_compuesta, tam_comp = RuleCompiler.empaquetar_reglas([regla_compuesta])
+        self.assertLessEqual(tam_comp, 100) # Muy compacto (< 100 bytes)
+
     # 2. Pruebas del Registro de Dispositivos y Búsqueda Semántica
     def test_device_registry(self):
         # Registrar baliza de nuevo nodo
@@ -173,6 +188,34 @@ class TestEnaSystem(unittest.TestCase):
             resp_desv = hermes_tools.desvincular_dispositivo("Luz de la cocina")
             self.assertIn("ha sido desvinculado", resp_desv)
             self.assertEqual(len(self.registry.listar_dispositivos()), 0)
+
+            # K. Registro y prueba de automatización multi-condición con Hermes
+            hermes_tools.registrar_dispositivo(
+                alias="Clima inteligente",
+                mac="24:6F:28:AB:12:34",
+                funcion_dispositivo="Aire acondicionado con DHT22 y switches",
+                pin_actuador=15
+            )
+
+            resp_multi = hermes_tools.crear_automatizacion_compuesta(
+                dispositivo="Clima inteligente",
+                lista_condiciones=[
+                    {"pin": 4, "sub": "temp", "op": ">", "val": 28},
+                    {"pin": 13, "op": "==", "val": 1},
+                    {"pin": 14, "op": "==", "val": 1}
+                ],
+                logica="AND",
+                pin_actuador=15,
+                accion="encender"
+            )
+            self.assertIn("multi-condición (AND)", resp_multi)
+
+            # L. Prueba de mostrar en pantalla OLED con Hermes
+            resp_disp = hermes_tools.mostrar_en_pantalla(
+                dispositivo="Clima inteligente",
+                lineas=["Temp: 29 C", "Puerta: CERRADA", "Aire: ON"]
+            )
+            self.assertIn("pantalla", resp_disp)
 
         finally:
             server.shutdown()

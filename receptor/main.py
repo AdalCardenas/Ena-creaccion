@@ -119,15 +119,21 @@ while True:
                     pass
                 e.send(host, ujson.dumps({"status": "identificando"}).encode('utf-8'))
 
+            # Comando especial: Mostrar texto en pantalla OLED
+            elif isinstance(paquete, dict) and paquete.get("cmd") == "display":
+                lineas = paquete.get("lineas", [])
+                ok = motor.hal.mostrar_en_oled(lineas)
+                try:
+                    e.add_peer(host)
+                except OSError:
+                    pass
+                e.send(host, ujson.dumps({"status": "display_ok" if ok else "display_error"}).encode('utf-8'))
+
             # Actualización de reglas de automatización
             elif isinstance(paquete, dict) and "r" in paquete:
                 persistir_y_cargar_reglas(msg)
                 if not motor.reglas:
-                    for p in motor.pines_out.values():
-                        try:
-                            p.value(0)
-                        except:
-                            pass
+                    motor.hal.apagar_todas_las_salidas()
                 print(f"Nuevas reglas aplicadas ({len(motor.reglas)} activas).")
                 try:
                     e.add_peer(host)
