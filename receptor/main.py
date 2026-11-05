@@ -1,162 +1,215 @@
 """
 main.py - Firmware del Nodo Receptor / Micro-PLC Autónomo (MicroPython).
-Dispositivo: Nodo Receptor ESP32
+
+Dispositivo: ESP8266 ESP-01S (8 pines) / NodeMCU / Wemos D1 Mini
 Proyecto: Ena-creaccion / Ena-receptor
+
+Este archivo sólo se ocupa del arranque: radio, watchdog, flash y bucle. Toda
+la interpretación de tramas vive en `manejador.py` (probado en la Raspberry Pi)
+y el motor de control en `motor_reglas.py`.
+
+Autenticación: si existe `secreto.py` junto a este archivo, todas las tramas
+recibidas deben venir firmadas con ese secreto. Si no existe, el nodo funciona
+en modo abierto (útil para pruebas) y lo anuncia en su baliza con "auth":0.
 """
 import espnow
 import network
 import machine
-import time
 import os
-import ujson
+
+try:
+    import ujson as ujson
+except ImportError:  # CPython / pruebas
+    import json as ujson
+
+import gc
+
+import reloj
 from motor_reglas import MotorReglas
+from manejador import ManejadorPaquetes
+
+# Secreto compartido opcional (mismo valor que en la Raspberry Pi).
+try:
+    from secreto import CLAVE
+except ImportError:
+    CLAVE = None
+
+try:
+    from secreto import MAC_FORZADA
+except ImportError:
+    MAC_FORZADA = None
 
 ARCHIVO_REGLAS = "reglas.json"
-BROADCAST_MAC = b'\xff\xff\xff\xff\xff\xff'
-PIN_LED_IDENT = 2  # LED azul integrado en la mayoría de ESP32 DevKit
+ARCHIVO_TEMP = "reglas.tmp"
+BROADCAST_MAC = b"\xff\xff\xff\xff\xff\xff"
+PIN_LED_IDENT = 2  # LED azul integrado en GPIO 2 (Active-LOW manejado por HAL)
 
-# 1. Configurar radio en modo Estación (STA) y fijar canal 1
+# 1. Configurar radio en modo Estación (STA) y fijar sintetizador en Canal 1
 sta = network.WLAN(network.STA_IF)
 sta.active(True)
 sta.disconnect()
 
-# Dejar AP activo en canal 1 bloquea el sintetizador de radio del ESP32 en canal 1
+# Dejar AP activo en canal 1 bloquea el hardware del ESP8266 en canal 1
 ap = network.WLAN(network.AP_IF)
 ap.active(True)
 try:
     ap.config(channel=1)
 except Exception as err:
-    print("Aviso canal AP:", err)
+    print("[Radio] Aviso canal AP:", err)
 
 # 2. Inicializar ESP-NOW y registrar broadcast para balizas
 e = espnow.ESPNow()
 e.active(True)
 try:
     e.add_peer(BROADCAST_MAC)
-    print("ESP-NOW activo. Peer broadcast registrado en canal 1.")
+    print("[ESP-NOW] Activo en Canal 1. Peer broadcast registrado.")
 except Exception as err:
-    print("Aviso al registrar broadcast:", err)
+    print("[ESP-NOW] Aviso al registrar broadcast:", err)
 
-# LED de identificación física
-led_ident = machine.Pin(PIN_LED_IDENT, machine.Pin.OUT)
-led_ident.value(0)
-tiempo_fin_ident = 0
 
-# 3. Inicializar Motor de Reglas y cargar reglas previas de Flash
+def _mac_local():
+    """MAC de la interfaz STA: es la que ve el gateway en las tramas."""
+    if MAC_FORZADA:
+        return str(MAC_FORZADA).upper()
+    try:
+        mac = sta.config("mac")
+        return ":".join("%02X" % b for b in mac)
+    except Exception as err:
+        print("[Radio] No se pudo leer la MAC:", err)
+        return "00:00:00:00:00:00"
+
+
+# 3. Inicializar Motor de Reglas (y HAL)
 motor = MotorReglas()
 
-def persistir_y_cargar_reglas(trama_bytes):
-    """Guarda las reglas en la memoria Flash y las aplica al motor."""
-    motor.cargar_reglas(trama_bytes)
+
+def persistir_reglas(reglas, hw, contador):
+    """
+    Guarda la configuración en flash de forma atómica.
+
+    Se escribe primero un temporal y luego se renombra: si se corta la energía
+    a mitad de escritura, el archivo anterior sigue siendo válido.
+    """
+    datos = {"v": 2, "r": reglas, "hw": hw or [], "n": int(contador)}
+    texto = ujson.dumps(datos)
     try:
-        with open(ARCHIVO_REGLAS, "wb") as f:
-            f.write(trama_bytes)
+        with open(ARCHIVO_TEMP, "w") as archivo:
+            archivo.write(texto)
+            archivo.flush()
+        try:
+            os.remove(ARCHIVO_REGLAS)
+        except OSError:
+            pass
+        os.rename(ARCHIVO_TEMP, ARCHIVO_REGLAS)
     except Exception as err:
-        print("Aviso: no se pudo guardar en Flash:", err)
+        print("[Flash] Aviso al guardar reglas:", err)
+    gc.collect()
 
-# Al arrancar: recuperar última configuración persistida
-tiene_reglas = False
+
+# 4. Recuperar la última configuración persistida
+manejador = ManejadorPaquetes(
+    motor,
+    mac_local=_mac_local(),
+    clave=CLAVE,
+    persistir=persistir_reglas,
+)
+
 try:
-    with open(ARCHIVO_REGLAS, "rb") as f:
-        datos_guardados = f.read()
-        if datos_guardados:
-            motor.cargar_reglas(datos_guardados)
-            tiene_reglas = len(motor.reglas) > 0
-            print(f"Reglas previas cargadas ({len(motor.reglas)} activas).")
+    with open(ARCHIVO_REGLAS, "r") as archivo:
+        texto_guardado = archivo.read()
+    guardado = ujson.loads(texto_guardado)
+    if isinstance(guardado, dict):
+        manejador.restaurar_contador(guardado.get("n"))
+        if motor.cargar_reglas(texto_guardado):
+            print(f"[Flash] Reglas previas cargadas ({len(motor.reglas)} activas).")
 except OSError:
-    print("Sin reglas previas en Flash. Esperando configuración...")
+    print("[Flash] Sin reglas previas. Esperando configuración de Hermes...")
+except Exception as err:
+    # Un archivo corrupto no debe impedir que el nodo arranque.
+    print("[Flash] reglas.json ilegible, se ignora:", err)
 
-# 4. Inicializar Watchdog (3 segundos)
-wdt = machine.WDT(timeout=3000)
+# Asegurar LED de identificación apagado al inicio
+motor.hal.asegurar_pin_salida(PIN_LED_IDENT)
+manejador.apagar_led_identificacion()
 
-print("Nodo receptor en línea y escuchando en Canal 1...")
+# 5. Watchdog Hardware (compatible con ESP8266 sin argumento timeout)
+try:
+    wdt = machine.WDT()
+    print("[WDT] Watchdog hardware activo.")
+except Exception as err:
+    print("[WDT] Aviso iniciando Watchdog:", err)
+    wdt = None
 
-# Control de baliza periódica de auto-descubrimiento
-ultimo_beacon = 0
+print("[Nodo] ESP-01S en línea y escuchando en Canal 1...")
+if CLAVE:
+    print("[Nodo] Autenticacion activa (HMAC-SHA256).")
+else:
+    print("[Nodo] AVISO: sin secreto.py, el nodo acepta tramas sin firmar.")
+
+ultima_baliza = 0
+ultimo_gateway = None
+
+
+def _recibir():
+    """Lee una trama de radio sin bloquear; tolera firmware que retorna None."""
+    try:
+        resultado = e.recv(0)
+    except OSError:
+        return None, None
+    if not resultado:
+        return None, None
+    return resultado[0], resultado[1]
+
+
+def _enviar(destino, datos):
+    """Envía al gateway registrándolo como peer si es la primera vez."""
+    if destino is None:
+        return False
+    if destino != ultimo_gateway:
+        try:
+            e.add_peer(destino)
+        except OSError:
+            pass
+    try:
+        return e.send(destino, datos)
+    except Exception as err:
+        print("[Nodo] Error al responder:", err)
+        return False
+
 
 while True:
-    wdt.feed()
-    ahora = time.ticks_ms()
+    if wdt:
+        wdt.feed()
 
-    # --- A. Baliza de auto-descubrimiento para Hermes Agent ---
-    intervalo_beacon = 5000 if not motor.reglas else 30000  # 5s si nuevo/sin reglas, 30s si configurado
-    if time.ticks_diff(ahora, ultimo_beacon) >= intervalo_beacon:
-        ultimo_beacon = ahora
-        beacon_data = ujson.dumps({
-            "beacon": "ena_node",
-            "status": "nuevo" if not motor.reglas else "listo",
-            "reglas": len(motor.reglas)
-        }).encode('utf-8')
+    ahora = reloj.ahora_ms()
+
+    # --- A. Baliza de auto-descubrimiento ---
+    intervalo = 5000 if not motor.reglas else 30000
+    if reloj.diferencia(ahora, ultima_baliza) >= intervalo:
+        ultima_baliza = ahora
+        gc.collect()  # mantener RAM libre en ESP8266 (~35 KB)
         try:
-            exito = e.send(BROADCAST_MAC, beacon_data)
-            print(f"[Nodo] Baliza emitida ({len(beacon_data)} bytes, enviado={exito})")
+            baliza = manejador.construir_baliza()
+            enviado = e.send(BROADCAST_MAC, baliza)
+            print(f"[Nodo] Baliza emitida ({len(baliza)} bytes, enviado={enviado})")
         except Exception as err:
             print("[Nodo] Error al emitir baliza:", err)
 
-    # --- B. Parpadeo de Identificación Visual si fue solicitado ---
-    if tiempo_fin_ident > 0:
-        if time.ticks_diff(ahora, tiempo_fin_ident) < 0:
-            # Parpadeo rápido (150ms)
-            fase = (ahora // 150) % 2
-            led_ident.value(fase)
-        else:
-            tiempo_fin_ident = 0
-            led_ident.value(0)
+    # --- B. Parpadeo de identificación si fue solicitado ---
+    manejador.tick()
 
-    # --- C. Comprobar si llegó un comando o actualización por radio ---
-    host, msg = e.recv(0)
-    if msg:
-        try:
-            paquete = ujson.loads(msg)
+    # --- C. Tramas entrantes: comandos, reglas o consultas ---
+    for _ in range(4):
+        host, msg = _recibir()
+        if not msg:
+            break
+        if host:
+            ultimo_gateway = host
+        for respuesta in manejador.procesar(msg):
+            _enviar(host, respuesta)
 
-            # Comando especial: Identificación física
-            if isinstance(paquete, dict) and paquete.get("cmd") == "identificar":
-                duracion = paquete.get("duracion_ms", 3000)
-                tiempo_fin_ident = time.ticks_add(ahora, duracion)
-                try:
-                    e.add_peer(host)
-                except OSError:
-                    pass
-                e.send(host, ujson.dumps({"status": "identificando"}).encode('utf-8'))
-
-            # Comando especial: Mostrar texto en pantalla OLED
-            elif isinstance(paquete, dict) and paquete.get("cmd") == "display":
-                lineas = paquete.get("lineas", [])
-                ok = motor.hal.mostrar_en_oled(lineas)
-                try:
-                    e.add_peer(host)
-                except OSError:
-                    pass
-                e.send(host, ujson.dumps({"status": "display_ok" if ok else "display_error"}).encode('utf-8'))
-
-            # Actualización de reglas de automatización
-            elif isinstance(paquete, dict) and "r" in paquete:
-                persistir_y_cargar_reglas(msg)
-                if not motor.reglas:
-                    motor.hal.apagar_todas_las_salidas()
-                print(f"Nuevas reglas aplicadas ({len(motor.reglas)} activas).")
-                try:
-                    e.add_peer(host)
-                except OSError:
-                    pass
-                respuesta = ujson.dumps({"status": "ok", "reglas": len(motor.reglas)}).encode('utf-8')
-                e.send(host, respuesta)
-
-            else:
-                # Intento de cargar regla si viene en otro formato
-                persistir_y_cargar_reglas(msg)
-
-        except Exception as err:
-            print("Error procesando mensaje:", err)
-            try:
-                e.add_peer(host)
-            except OSError:
-                pass
-            respuesta = ujson.dumps({"status": "error", "detalle": str(err)}).encode('utf-8')
-            e.send(host, respuesta)
-
-    # --- D. Ciclo de escaneo y temporizadores del micro-PLC ---
+    # --- D. Ciclo de escaneo del micro-PLC ---
     motor.ciclo_evaluacion()
 
-    # --- E. Scan time controlado (10ms ~ 100 Hz) ---
-    time.sleep_ms(10)
+    # --- E. Scan time controlado (10 ms ~ 100 Hz) ---
+    reloj.dormir_ms(10)

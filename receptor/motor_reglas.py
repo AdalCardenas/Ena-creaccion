@@ -1,192 +1,337 @@
 """
 motor_reglas.py - Motor de Reglas reactivo, no bloqueante y multi-condición para Micro-PLC.
-Proyecto: Ena-creaccion / Ena-receptor
+
+Proyecto: Ena-creaccion / Ena-receptor (ESP8266 / ESP-01S)
+
+Formato de regla (8 elementos):
+
+    [r_id, cond, op_logica, val, p_out, act, t_type, t_ms]
+
+- Regla simple:     cond = pin de entrada, op_logica = operador (0..4), val = umbral.
+- Regla compuesta:  cond = [[pin, op, val], ...], op_logica = 0 (AND) / 1 (OR).
+
+El tipo de cada pin ya no se adivina por el umbral (`val > 1`): lo declara el
+host en la lista `hw` de la trama. Sin declaración, el pin se trata como
+entrada digital. Un sensor analógico comparado contra 0/1 antes se configuraba
+por error como digital y jamás devolvía lecturas.
 """
-import time
-import ujson
+try:
+    import ujson as ujson
+except ImportError:  # CPython
+    import json as ujson
+
 import gc
-from hal import HardwareManager
+
+try:
+    from . import protocolo
+    from . import reloj
+    from .hal import HardwareManager, resolver_pin
+except ImportError:  # ejecución plana en el dispositivo
+    import protocolo
+    import reloj
+    from hal import HardwareManager, resolver_pin
+
+# Tipos declarados en la lista "hw" de la trama.
+TIPOS_ADC = ("adc", "analog", "analogico", "analógica")
+TIPOS_ENTRADA = ("digital", "digital_in", "entrada", "boton", "button", "pulsador")
+TIPOS_SALIDA = ("digital_out", "salida", "rele", "relay", "led", "pwm")
+TIPOS_DHT = ("dht22", "dht11", "dht")
+TIPOS_OLED = ("oled", "ssd1306")
+
+# Frecuencia mínima de los efectos visuales: evita conmutar a 100 Hz.
+MIN_MS_EFECTO = 20
 
 
 class MotorReglas:
-    """
-    Motor de ejecución de reglas para MicroPython con soporte para:
-    - Reglas simples: [r_id, p_in, op, val, p_out, act, t_type, t_ms]
-    - Reglas multi-condición (AND/OR):
-      [r_id, [[p1, op1, val1], [p2, op2, val2], ...], logica_and_or, 0, p_out, act, t_type, t_ms]
-      (logica_and_or: 0 o "AND" para conjunción, 1 o "OR" para disyunción)
-    """
+    """Ejecución de reglas con soporte para AND/OR y seis temporizadores."""
 
     def __init__(self, hal: HardwareManager = None):
         self.hal = hal if hal is not None else HardwareManager()
         self.reglas = []
         self.estado_timers = {}
+        self.pines_adc = set()
+        self._errores_ciclo = 0
+
+    # =====================================================================
+    # CARGA Y VALIDACIÓN
+    # =====================================================================
+
+    def aplicar_reglas(self, reglas, hw=None):
+        """
+        Valida, inicializa el hardware declarado y reemplaza la configuración.
+
+        Lanza protocolo.ErrorProtocolo si algo es inválido, de modo que el nodo
+        pueda responder con un error en vez de aplicar media configuración.
+        """
+        limpias, motivo = protocolo.validar_reglas(reglas)
+        if motivo:
+            raise protocolo.ErrorProtocolo(motivo)
+
+        descriptores, motivo_hw = protocolo.validar_hw(hw)
+        if motivo_hw:
+            raise protocolo.ErrorProtocolo(motivo_hw)
+
+        self.reglas = limpias
+        self.estado_timers = {}
+        self.pines_adc = set()
+
+        for item in descriptores:
+            self._configurar_hw(item)
+        for indice in range(len(self.reglas)):
+            self._preparar_regla(indice)
+
+        gc.collect()
+        return len(self.reglas)
 
     def cargar_reglas(self, trama_bytes):
         """
-        Parsea una trama JSON con la lista de reglas e inicializa el hardware
-        en la capa HAL de manera segura.
+        Compatibilidad: acepta la trama completa {"r": [...], "hw": [...]}.
+
+        Retorna True si la configuración se aplicó.
         """
-        datos = ujson.loads(trama_bytes)
-        self.reglas = datos.get("r", [])
-        self.estado_timers.clear()
+        try:
+            datos = ujson.loads(trama_bytes)
+        except (ValueError, OSError) as err:
+            print(f"[Motor] Trama ilegible: {err}")
+            return False
 
-        # Inicialización de hardware explícito si la trama incluye "hw"
-        hw_lista = datos.get("hw", [])
-        for item in hw_lista:
-            tipo = item.get("tipo", "").lower()
-            pin = item.get("pin")
-            if tipo in ["dht22", "dht11"]:
-                self.hal.asegurar_dht(pin, es_dht22=(tipo == "dht22"))
-            elif tipo in ["oled", "ssd1306"]:
-                self.hal.asegurar_oled(
-                    sda_pin=item.get("sda", 21),
-                    scl_pin=item.get("scl", 22),
-                    ancho=item.get("ancho", 128),
-                    alto=item.get("alto", 64)
-                )
+        if not isinstance(datos, dict):
+            print("[Motor] La trama no es un objeto JSON.")
+            return False
 
-        for r in self.reglas:
-            # Estructura: [r_id, cond_spec, op_logica, val, p_out, act, t_type, t_ms]
-            r_id = r[0]
-            cond_spec = r[1]
-            op_logica = r[2]
-            val = r[3]
-            p_out = r[4]
+        try:
+            self.aplicar_reglas(datos.get("r", []), datos.get("hw"))
+            return True
+        except protocolo.ErrorProtocolo as err:
+            print(f"[Motor] Configuracion rechazada: {err}")
+            return False
 
-            self.estado_timers[r_id] = [time.ticks_ms(), False]
+    def _configurar_hw(self, item):
+        """Inicializa un descriptor de hardware declarado por el host."""
+        tipo = str(item.get("tipo", "")).strip().lower()
+        pin = resolver_pin(item.get("pin"))
 
-            # Inicializar salida
-            if p_out is not None and p_out >= 0:
-                self.hal.asegurar_pin_salida(p_out)
+        if tipo in TIPOS_ADC:
+            if pin is None:
+                return
+            self.pines_adc.add(pin)
+            self.hal.asegurar_pin_entrada(pin, es_adc=True)
+            return
 
-            # Inicializar entradas:
-            # Caso A: Multi-condición (lista de sub-condiciones)
-            if isinstance(cond_spec, list) and len(cond_spec) > 0 and isinstance(cond_spec[0], (list, tuple)):
-                for sub in cond_spec:
-                    sub_p = sub[0]
-                    sub_val = sub[2]
-                    pin_num = sub_p[0] if isinstance(sub_p, (list, tuple)) else sub_p
-                    if pin_num is not None and pin_num >= 0:
-                        es_adc = (sub_val > 1) and (pin_num not in self.hal.sensores_dht)
-                        self.hal.asegurar_pin_entrada(pin_num, es_adc=es_adc)
+        if tipo in TIPOS_DHT:
+            self.hal.asegurar_dht(pin, es_dht22=(tipo != "dht11"))
+            return
 
-            # Caso B: Regla simple tradicional
-            elif cond_spec is not None and cond_spec >= 0 and op_logica != 4:
-                es_adc = (val > 1) and (cond_spec not in self.hal.sensores_dht)
-                self.hal.asegurar_pin_entrada(cond_spec, es_adc=es_adc)
+        if tipo in TIPOS_OLED:
+            self.hal.asegurar_oled(
+                sda_pin=item.get("sda", 0),
+                scl_pin=item.get("scl", 2),
+                ancho=item.get("ancho", 128),
+                alto=item.get("alto", 64),
+            )
+            return
 
-        gc.collect()
+        if tipo in TIPOS_SALIDA:
+            self.hal.asegurar_pin_salida(pin)
+            return
+
+        # Entrada digital: es el valor por omisión.
+        self.hal.asegurar_pin_entrada(pin, es_adc=False)
+
+    def _preparar_regla(self, indice):
+        regla = self.reglas[indice]
+        self.estado_timers[indice] = [reloj.ahora_ms(), False]
+
+        p_out = resolver_pin(regla[4])
+        if p_out is not None:
+            self.hal.asegurar_pin_salida(p_out)
+
+        for pin in self._pines_de_condicion(regla[1]):
+            if pin is None:
+                continue
+            if pin in self.hal.sensores_dht:
+                continue  # el DHT gestiona su propio objeto de pin
+            self.hal.asegurar_pin_entrada(pin, es_adc=(pin in self.pines_adc))
+
+    def _pines_de_condicion(self, cond):
+        """Extrae los GPIO implicados en una condición simple o compuesta."""
+        resultado = []
+        if isinstance(cond, (list, tuple)) and len(cond) > 0 \
+                and isinstance(cond[0], (list, tuple)):
+            for sub in cond:
+                espec = sub[0]
+                if isinstance(espec, (list, tuple)):
+                    resultado.append(resolver_pin(espec[0]))
+                else:
+                    resultado.append(resolver_pin(espec))
+        else:
+            resultado.append(resolver_pin(cond))
+        return resultado
+
+    def apagar_todo(self):
+        """Apaga todas las salidas y descarta los temporizadores en curso."""
+        self.hal.apagar_todas_las_salidas()
+        self.estado_timers = {}
+        for indice in range(len(self.reglas)):
+            self.estado_timers[indice] = [reloj.ahora_ms(), False]
+
+    # =====================================================================
+    # EVALUACIÓN DE CONDICIONES
+    # =====================================================================
 
     def _evaluar_condicion_simple(self, p_spec, op, val):
-        """Evalúa un único sensor o canal contra un umbral."""
-        if op == 4:
+        if op == 4:  # incondicional
             return True
 
         if isinstance(p_spec, (list, tuple)):
-            pin_num = p_spec[0]
+            pin_num = resolver_pin(p_spec[0])
             sub_canal = p_spec[1] if len(p_spec) > 1 else None
         else:
-            pin_num = p_spec
+            pin_num = resolver_pin(p_spec)
             sub_canal = None
 
         if pin_num is None or pin_num < 0:
             return False
 
         lectura = self.hal.leer_sensor(pin_num, sub_canal)
-
-        if op == 0: return lectura == val
-        if op == 1: return lectura != val
-        if op == 2: return lectura > val
-        if op == 3: return lectura < val
+        try:
+            if op == 0:
+                return lectura == val
+            if op == 1:
+                return lectura != val
+            if op == 2:
+                return lectura > val
+            if op == 3:
+                return lectura < val
+        except TypeError:
+            return False
         return False
 
     def _evaluar_condicion(self, cond_spec, op_o_logica, val):
-        """
-        Evalúa la condición general de la regla:
-        - Soporta evaluación compuesta AND/OR si cond_spec es lista de subcondiciones.
-        - Soporta evaluación simple tradicional.
-        """
-        # Caso 1: Multi-condición
-        if isinstance(cond_spec, list) and len(cond_spec) > 0 and isinstance(cond_spec[0], (list, tuple)):
-            # 0 o "AND" = Conjunción (todas deben cumplirse)
-            es_and = (op_o_logica in [0, "AND", "and"])
+        """Evalúa una condición simple o una conjunción/disyunción."""
+        if isinstance(cond_spec, (list, tuple)) and len(cond_spec) > 0 \
+                and isinstance(cond_spec[0], (list, tuple)):
+            es_and = op_o_logica in (0, "AND", "and")
             if es_and:
-                for sc in cond_spec:
-                    if not self._evaluar_condicion_simple(sc[0], sc[1], sc[2]):
+                for sub in cond_spec:
+                    if not self._evaluar_condicion_simple(sub[0], sub[1], sub[2]):
                         return False
                 return True
-            else:
-                # Disyunción OR (al menos una debe cumplirse)
-                for sc in cond_spec:
-                    if self._evaluar_condicion_simple(sc[0], sc[1], sc[2]):
-                        return True
-                return False
+            for sub in cond_spec:
+                if self._evaluar_condicion_simple(sub[0], sub[1], sub[2]):
+                    return True
+            return False
 
-        # Caso 2: Condición simple tradicional
         return self._evaluar_condicion_simple(cond_spec, op_o_logica, val)
 
+    # =====================================================================
+    # CICLO DE ESCANEO (~100 Hz)
+    # =====================================================================
+
     def ciclo_evaluacion(self):
-        """
-        Ciclo de escaneo principal. Debe ejecutarse periódicamente dentro
-        del bucle principal (while True) sin bloqueos.
-        """
-        ahora = time.ticks_ms()
-        for r in self.reglas:
-            r_id, cond_spec, op_logica, val, p_out, act, t_type, t_ms = r
-            condicion_cumplida = self._evaluar_condicion(cond_spec, op_logica, val)
-            t_inicio, t_activo = self.estado_timers.get(r_id, [ahora, False])
+        """Ciclo principal del micro-PLC, sin bloqueos."""
+        ahora = reloj.ahora_ms()
+        for indice in range(len(self.reglas)):
+            try:
+                self._evaluar_regla(indice, ahora)
+            except Exception as err:
+                # Una regla defectuosa no debe tumbar el nodo ni inundar la consola.
+                self._errores_ciclo += 1
+                if self._errores_ciclo <= 5:
+                    print(f"[Motor] Error en regla {indice}: {err}")
 
-            # Tipo 0: Inmediato (Combinacional directo)
-            if t_type == 0:
-                self.hal.aplicar_salida(p_out, act if condicion_cumplida else (0 if act == 1 else 1))
+    @staticmethod
+    def _complemento(act):
+        if act == 1:
+            return 0
+        if act == 0:
+            return 1
+        return 0
 
-            # Tipo 1: Retardo al encendido (TON)
-            elif t_type == 1:
-                if condicion_cumplida:
-                    if not t_activo:
-                        self.estado_timers[r_id] = [ahora, True]
-                    elif time.ticks_diff(ahora, t_inicio) >= t_ms:
-                        self.hal.aplicar_salida(p_out, act)
+    def _evaluar_regla(self, indice, ahora):
+        regla = self.reglas[indice]
+        cond, op_logica, val, p_out, act, t_type, t_ms = (
+            regla[1], regla[2], regla[3], regla[4], regla[5], regla[6], regla[7]
+        )
+        pin_out = resolver_pin(p_out)
+        cumple = self._evaluar_condicion(cond, op_logica, val)
+
+        estado = self.estado_timers.get(indice)
+        if estado is None:
+            estado = [ahora, False]
+            self.estado_timers[indice] = estado
+        t_inicio, t_activo = estado
+
+        # Tipo 0: inmediato / combinacional.
+        if t_type == 0:
+            if act == 2:
+                # Conmutar sólo en el flanco, no en cada ciclo de 10 ms.
+                if cumple and not t_activo:
+                    self.hal.aplicar_salida(pin_out, 2)
+                self.estado_timers[indice] = [t_inicio, cumple]
+            else:
+                self.hal.aplicar_salida(
+                    pin_out, act if cumple else self._complemento(act)
+                )
+
+        # Tipo 1: retardo al encendido (TON).
+        elif t_type == 1:
+            if cumple:
+                if not t_activo:
+                    self.estado_timers[indice] = [ahora, True]
+                elif reloj.diferencia(ahora, t_inicio) >= t_ms:
+                    self.hal.aplicar_salida(pin_out, act)
+            else:
+                self.estado_timers[indice] = [ahora, False]
+                self.hal.aplicar_salida(pin_out, self._complemento(act))
+
+        # Tipo 2: pulso monoestable.
+        elif t_type == 2:
+            if cumple and not t_activo:
+                self.hal.aplicar_salida(pin_out, act)
+                self.estado_timers[indice] = [ahora, True]
+            elif t_activo:
+                if reloj.diferencia(ahora, t_inicio) >= t_ms:
+                    self.hal.aplicar_salida(pin_out, self._complemento(act))
+                    if not cumple:
+                        self.estado_timers[indice] = [ahora, False]
+            else:
+                self.hal.aplicar_salida(pin_out, self._complemento(act))
+
+        # Tipo 3: oscilador periódico simétrico (BLINK).
+        elif t_type == 3:
+            periodo = t_ms if t_ms >= MIN_MS_EFECTO else MIN_MS_EFECTO
+            if cumple:
+                if reloj.diferencia(ahora, t_inicio) >= periodo:
+                    nuevo = not t_activo
+                    self.estado_timers[indice] = [ahora, nuevo]
+                    self.hal.aplicar_salida(pin_out, 1 if nuevo else 0)
+            else:
+                self.estado_timers[indice] = [ahora, False]
+                self.hal.aplicar_salida(pin_out, 0)
+
+        # Tipo 4: latido de vida industrial (doble destello).
+        elif t_type == 4:
+            periodo = t_ms if t_ms >= 500 else 500
+            if cumple:
+                fase = reloj.diferencia(ahora, t_inicio) % periodo
+                encendido = (fase < 80) or (180 <= fase < 260)
+                self.hal.aplicar_salida(pin_out, 1 if encendido else 0)
+            else:
+                self.estado_timers[indice] = [ahora, False]
+                self.hal.aplicar_salida(pin_out, 0)
+
+        # Tipo 5: desvanecimiento PWM / respiración.
+        elif t_type == 5:
+            medio = t_ms if t_ms >= MIN_MS_EFECTO else MIN_MS_EFECTO
+            if cumple:
+                ciclo = 2 * medio
+                fase = reloj.diferencia(ahora, t_inicio) % ciclo
+                if fase < medio:
+                    brillo = fase / medio
                 else:
-                    self.estado_timers[r_id] = [0, False]
-                    self.hal.aplicar_salida(p_out, 0)
-
-            # Tipo 2: Pulso Monoestable (PULSE)
-            elif t_type == 2:
-                if condicion_cumplida and not t_activo:
-                    self.hal.aplicar_salida(p_out, act)
-                    self.estado_timers[r_id] = [ahora, True]
-                elif t_activo:
-                    if time.ticks_diff(ahora, t_inicio) >= t_ms:
-                        self.hal.aplicar_salida(p_out, 0)
-                        if not condicion_cumplida:  # Rearme al cesar condición
-                            self.estado_timers[r_id] = [0, False]
-
-            # Tipo 3: Oscilador Periódico Simétrico (BLINK)
-            elif t_type == 3:
-                if condicion_cumplida:
-                    if time.ticks_diff(ahora, t_inicio) >= t_ms:
-                        nuevo_estado = not t_activo
-                        self.estado_timers[r_id] = [ahora, nuevo_estado]
-                        self.hal.aplicar_salida(p_out, 1 if nuevo_estado else 0)
-                else:
-                    self.estado_timers[r_id] = [ahora, False]
-                    self.hal.aplicar_salida(p_out, 0)
-
-            # Tipo 4: Latido de Vida Industrial (HEARTBEAT)
-            elif t_type == 4:
-                if condicion_cumplida:
-                    diferencia = time.ticks_diff(ahora, t_inicio)
-                    if diferencia >= t_ms:
-                        t_inicio = ahora
-                        self.estado_timers[r_id][0] = ahora
-                        diferencia = 0
-
-                    if (0 <= diferencia < 80) or (180 <= diferencia < 260):
-                        self.hal.aplicar_salida(p_out, 1)
-                    else:
-                        self.hal.aplicar_salida(p_out, 0)
-                else:
-                    self.hal.aplicar_salida(p_out, 0)
-                    self.estado_timers[r_id] = [ahora, False]
+                    brillo = (ciclo - fase) / medio
+                self.hal.aplicar_pwm(pin_out, brillo)
+            else:
+                self.hal.aplicar_pwm(pin_out, 0.0)
+                self.estado_timers[indice] = [ahora, False]

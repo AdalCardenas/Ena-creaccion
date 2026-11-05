@@ -217,6 +217,37 @@ class TestEnaSystem(unittest.TestCase):
             )
             self.assertIn("pantalla", resp_disp)
 
+            # M. Prueba específica ESP8266 ESP-01S: 2 Botones y LED azul
+            hermes_tools.registrar_dispositivo(
+                alias="Nodo Taller ESP01S",
+                mac="A0:20:A6:11:22:33",
+                funcion_dispositivo="Control de LED con botones IO0 y RX",
+                pin_sensor="IO0",
+                pin_actuador="IO2"
+            )
+
+            # Regla 1: Boton 1 (IO0=0) AND Boton 2 (RX=1) -> Blink 1s
+            r1 = RuleCompiler.compilar_regla_compuesta(
+                condiciones=[{"pin": "IO0", "op": "==", "val": 0}, {"pin": "RX", "op": "==", "val": 1}],
+                logica="AND", p_out="IO2", accion=1, tipo_timer="blink", tiempo_segundos=1, r_id=1
+            )
+            # Regla 2: Boton 1 (IO0=1) AND Boton 2 (RX=0) -> Fade 1s (PWM)
+            r2 = RuleCompiler.compilar_regla_compuesta(
+                condiciones=[{"pin": "IO0", "op": "==", "val": 1}, {"pin": "RX", "op": "==", "val": 0}],
+                logica="AND", p_out="IO2", accion=1, tipo_timer="fade", tiempo_segundos=1, r_id=2
+            )
+            # Regla 3: Boton 1 (IO0=0) AND Boton 2 (RX=0) -> Continuo ON
+            r3 = RuleCompiler.compilar_regla_compuesta(
+                condiciones=[{"pin": "IO0", "op": "==", "val": 0}, {"pin": "RX", "op": "==", "val": 0}],
+                logica="AND", p_out="IO2", accion=1, tipo_timer="inmediato", tiempo_segundos=0, r_id=3
+            )
+
+            trama_esp01, tam_esp01 = RuleCompiler.empaquetar_reglas([r1, r2, r3])
+            self.assertLessEqual(tam_esp01, 250)
+            self.assertEqual(r1[4], 2)  # IO2 normalizado a GPIO 2
+            self.assertEqual(r1[1][0][0], 0)  # IO0 normalizado a GPIO 0
+            self.assertEqual(r1[1][1][0], 3)  # RX normalizado a GPIO 3
+
         finally:
             server.shutdown()
             server.server_close()

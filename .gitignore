@@ -141,3 +141,25 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Ena-creaccion: estado local, secretos y artefactos de pruebas
+# (el token de la API y el secreto compartido NUNCA deben versionarse)
+devices.json
+devices.json.tmp
+reglas.json
+reglas.tmp
+ena_config.json
+ena_config.json.tmp
+ena_secreto.py
+secreto.py
+test_devices.json
+rpi/tests/tmp_*.json
+
